@@ -12,7 +12,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 from telegram.error import TelegramError
 
 # --- Configuration ---
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("8840868848:AAGdJEYmfQ1yk-Qyi8OfVqUWQKLH3WMRlr0")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "5536833682"))
 DB_FILE = "users_db.json"
 
