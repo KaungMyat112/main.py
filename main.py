@@ -1,530 +1,245 @@
-# Copyright (C) @TheSmartBisnu
-# Channel: https://t.me/itsSmartDev
-
 import os
-import shutil
-import psutil
+import json
+import time
+import subprocess
+import re
+import threading
 import asyncio
-from time import time
+import signal
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.error import TelegramError
 
-from pyleaves import Leaves
-from pyrogram.enums import ParseMode
-from pyrogram import Client, filters
-from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+# --- Configuration ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "5536833682"))
+DB_FILE = "users_db.json"
 
-from helpers.utils import (
-    processMediaGroup,
-    progressArgs,
-    send_media
-)
+# လက်ရှိ Run နေဆဲ Process များကို သိမ်းဆည်းရန်
+running_processes = {}
 
-from helpers.forward import check_forward_permission, resolve_forward_chat_id
+# --- 🔐 STRICT SECURITY CHECK (ADMIN ONLY) ---
+def is_admin(user_id):
+    return user_id == ADMIN_ID
 
-from helpers.files import (
-    get_download_path,
-    fileSizeLimit,
-    get_readable_file_size,
-    get_readable_time,
-    cleanup_download,
-    cleanup_downloads_root
-)
+# --- Database Functions ---
+def load_db():
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r") as f: return json.load(f)
+        except: return {}
+    return {}
 
-from helpers.msg import (
-    getChatMsgID,
-    get_file_name,
-    get_raw_text
-)
+def save_db(db):
+    with open(DB_FILE, "w") as f: json.dump(db, f, indent=4)
 
-from config import PyroConf
-from logger import LOGGER
+# --- 🛡️ BACKGROUND PROCESS CLEANER (Zombie & Resource Leak Killer) ---
+def start_background_cleaner():
+    def loop_checker():
+        while True:
+            try:
+                time.sleep(30) # ၃၀ စက္ကန့်တစ်ကြိမ် မလိုအပ်တဲ့ data တွေ လိုက်ရှင်းမယ်
+                for uid, files in list(running_processes.items()):
+                    for fpath, p_info in list(files.items()):
+                        # အကယ်၍ Process က ရပ်သွားခဲ့ရင် သို့မဟုတ် poll() က အဖြေပြန်ပေးရင် Data ထဲက ဖြုတ်ပစ်မယ်
+                        if p_info["process"].poll() is not None:
+                            try:
+                                p_info["process"].wait() # ကောင်းကောင်းမွန်မွန် resource ပြန်လွှတ်ပေးရန်
+                            except: pass
+                            if uid in running_processes and fpath in running_processes[uid]:
+                                del running_processes[uid][fpath]
+            except: pass
+    threading.Thread(target=loop_checker, daemon=True).start()
 
-# Initialize the bot client
-bot = Client(
-    "media_bot",
-    api_id=PyroConf.API_ID,
-    api_hash=PyroConf.API_HASH,
-    bot_token=PyroConf.BOT_TOKEN,
-    workers=100,
-    parse_mode=ParseMode.MARKDOWN,
-    max_concurrent_transmissions=1, # ✅ SAFE DEFAULT
-    sleep_threshold=30,
-)
-
-# Client for user session
-user = Client(
-    "user_session",
-    workers=100,
-    session_string=PyroConf.SESSION_STRING,
-    max_concurrent_transmissions=1, # ✅ SAFE DEFAULT
-    sleep_threshold=30,
-)
-
-RUNNING_TASKS = set()
-download_semaphore = None
-forward_chat_id = None
-
-def track_task(coro):
-    task = asyncio.create_task(coro)
-    RUNNING_TASKS.add(task)
-    def _remove(_):
-        RUNNING_TASKS.discard(task)
-    task.add_done_callback(_remove)
-    return task
-
-
-@bot.on_message(filters.command("start") & filters.private)
-async def start(_, message: Message):
-    welcome_text = (
-        "👋 **Welcome to Media Downloader Bot!**\n\n"
-        "I can grab photos, videos, audio, and documents from any Telegram post.\n"
-        "Just send me a link (paste it directly or use `/dl <link>`),\n"
-        "or reply to a message with `/dl`.\n\n"
-        "ℹ️ Use `/help` to view all commands and examples.\n"
-        "🔒 Make sure the user client is part of the chat.\n\n"
-        "Ready? Send me a Telegram post link!"
-    )
-
-    markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Update Channel", url="https://t.me/Myanrestriced")]]
-    )
-    await message.reply(welcome_text, reply_markup=markup, disable_web_page_preview=True)
-
-
-@bot.on_message(filters.command("help") & filters.private)
-async def help_command(_, message: Message):
-    help_text = (
-        "💡 **Media Downloader Bot Help**\n\n"
-        "➤ **Download Media**\n"
-        "   – Send `/dl <post_URL>` **or** just paste a Telegram post link to fetch photos, videos, audio, or documents.\n\n"
-        "➤ **Batch Download**\n"
-        "   – Send `/bdl start_link end_link` to grab a series of posts in one go.\n"
-        "     💡 Example: `/bdl https://t.me/mychannel/100 https://t.me/mychannel/120`\n"
-        "**It will download all posts from ID 100 to 120.**\n\n"
-        "➤ **Requirements**\n"
-        "   – Make sure the user client is part of the chat.\n\n"
-        "➤ **If the bot hangs**\n"
-        "   – Send `/killall` to cancel any pending downloads.\n\n"
-        "➤ **Logs**\n"
-        "   – Send `/logs` to download the bot’s logs file.\n\n"
-        "➤ **Cleanup**\n"
-        "   – Send `/cleanup` to remove temporary downloaded files from disk.\n\n"
-        "➤ **Stats**\n"
-        "   – Send `/stats` to view current status:\n\n"
-        "**Example**:\n"
-        "  • `/dl https://t.me/itsSmartDev/547`\n"
-        "  • `https://t.me/itsSmartDev/547`"
-    )
+# --- Bot Handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     
-    markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Update Channel", url="https://t.me/itsSmartDev")]]
+    # ❌ Admin မဟုတ်ရင် လုံးဝ အသုံးပြုခွင့်မပေးပါ
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ <b>KRAW Bot Hosting [Private Mode]</b>\n\nဤ Bot သည် စနစ်ထိန်းသိမ်းသူ (Admin) သီးသန့်အသုံးပြုရန် ဖြစ်သောကြောင့် သင့်တွင် အသုံးပြုခွင့် မရှိပါဗျာ။", parse_mode="HTML")
+        return
+        
+    await update.message.reply_text(
+        f"👋 <b>KRAW Private Hosting မှ ကြိုဆိုပါတယ် Admin စော။</b>\n\n"
+        f"👑 Role: <code>OWNER / ADMIN</code>\n"
+        f"🚀 Server Limit: <code>အကန့်အသတ်မရှိ</code>\n\n"
+        f"အသုံးပြုရန် Python (.py) ဖိုင်ကို တင်ပေးနိုင်ပါပြီခင်ဗျာ။", 
+        parse_mode="HTML"
     )
-    await message.reply(help_text, reply_markup=markup, disable_web_page_preview=True)
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    # ❌ ဤနေရာတွင်လည်း တခြားသူ တင်လို့မရအောင် ထပ်ပိတ်ထားပါသည်
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ ခွင့်ပြုချက်မရှိဘဲ ဖိုင်တင်ခွင့် မရှိပါ။")
+        return
+        
+    document = update.message.document
+    if not document or not document.file_name: return
+    
+    # .py ဖိုင်အပြင် .zip သို့မဟုတ် utils.py ဖိုင်ပါ လက်ခံနိုင်ရန် စစ်ဆေးချက်
+    if not (document.file_name.endswith('.py') or document.file_name == 'utils.py'):
+        await update.message.reply_text("❌ ကျေးဇူးပြု၍ Python (.py) ဖိုင် သို့မဟုတ် `utils.py` ကိုသာ ပို့ပေးပါ။"); return
+        
+    file_name = f"admin_{int(time.time())}_{document.file_name}"
+    file = await context.bot.get_file(document.file_id)
+    await file.download_to_drive(file_name)
+    full_path = os.path.abspath(file_name)
+        
+    # အကယ်၍ utils.py ကို တင်လိုက်တာဆိုရင် ပင်မ directory ထဲမှာ utils.py အဖြစ် သိမ်းပေးမယ်
+    if document.file_name == 'utils.py':
+        os.rename(full_path, "utils.py")
+        await update.message.reply_text("✅ `utils.py` ဖိုင်ကို အောင်မြင်စွာ တင်ပြီးပါပြီ။ ယခုမှစ၍ script များက ၎င်းကို တိုက်ရိုက်အသုံးပြုနိုင်ပါပြီ။")
+        return
 
-@bot.on_message(filters.command("cleanup") & filters.private)
-async def cleanup_storage(_, message: Message):
-    try:
-        files_removed, bytes_freed = cleanup_downloads_root()
-        if files_removed == 0:
-            return await message.reply("🧹 **Cleanup complete:** no local downloads found.")
-        return await message.reply(
-            f"🧹 **Cleanup complete:** removed `{files_removed}` file(s), "
-            f"freed `{get_readable_file_size(bytes_freed)}`."
-        )
-    except Exception as e:
-        LOGGER(__name__).error(f"Cleanup failed: {e}")
-        return await message.reply("❌ **Cleanup failed.** Check logs for details.")
+    msg_file_key = f"file_{update.message.message_id}"
+    context.user_data[msg_file_key] = full_path
+    
+    keyboard = [
+        [InlineKeyboardButton("▶️ စတင် Run မည်", callback_data=f"run__{update.message.message_id}")], 
+        [InlineKeyboardButton("🗑️ စနစ်ထဲမှ ဖျက်မည်", callback_data=f"del__{update.message.message_id}")]
+    ]
+    await update.message.reply_text(text=f"📄 ဖိုင်အမည်: `{document.file_name}`\n🔴 အခြေအနေ: ရပ်နားထားသည်", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
+async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    
+    # ❌ ခလုတ်များကိုပါ Admin မှလွဲ၍ နှိပ်ခွင့်ပိတ်
+    if not is_admin(user_id): return
 
-async def handle_download(bot: Client, message: Message, post_url: str):
-    global forward_chat_id
-    async with download_semaphore:
-        if "?" in post_url:
-            post_url = post_url.split("?", 1)[0]
+    data_parts = query.data.split("__")
+    if len(data_parts) != 2: return
+    action, target_msg_id = data_parts[0], data_parts[1]
+    
+    msg_file_key = f"file_{target_msg_id}"
+    file_path = context.user_data.get(msg_file_key)
+    
+    if not file_path or not os.path.exists(file_path):
+        await query.edit_message_text("❌ ဤဖိုင်ခလုတ်သည် သက်တမ်းကုန်သွားပါပြီ။ ဖိုင်ပြန်ပို့ပေးပါ။"); return
+        
+    display_name = os.path.basename(file_path).split("_", 2)[-1]
+    if user_id not in running_processes: running_processes[user_id] = {}
 
+    if action == "run":
+        log_path = f"{file_path}.log"
+        log_file = open(log_path, "w")
         try:
-            effective_forward_chat_id = None
-            if forward_chat_id:
-                ok, err_msg = await check_forward_permission(bot, forward_chat_id)
-                if not ok:
-                    await message.reply(
-                        f"⚠️ **Forward chat misconfigured:** {err_msg}\n\n"
-                        "The file will be sent to you only."
-                    )
-                else:
-                    effective_forward_chat_id = forward_chat_id
+            # Process Group (os.setsid) ဆောက်ပြီး Background တင်မယ်
+            process = subprocess.Popen(["python3", file_path], stdout=log_file, stderr=log_file, preexec_fn=os.setsid)
+            running_processes[user_id][file_path] = {"process": process, "start_time": time.time(), "pid": process.pid, "display_name": display_name}
+            
+            keyboard = [
+                [InlineKeyboardButton("⏸️ အပြီးသတ် ရပ်မည် (Kill)", callback_data=f"stop__{target_msg_id}")], 
+                [InlineKeyboardButton("📋 Log ကြည့်မည်", callback_data=f"log__{target_msg_id}")]
+            ]
+            await query.edit_message_text(text=f"📄 ဖိုင်အမည်: `{display_name}`\n🟢 အခြေအနေ: အလုပ်လုပ်နေသည် (PID: <code>{process.pid}</code>)", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        except Exception as e: await query.edit_message_text(f"❌ Error: {str(e)}")
+        
+    elif action == "stop":
+        if user_id in running_processes and file_path in running_processes[user_id]:
+            p_info = running_processes[user_id][file_path]
+            try:
+                os.killpg(os.getpgid(p_info["process"].pid), signal.SIGKILL)
+                p_info["process"].wait()
+            except: pass
+            del running_processes[user_id][file_path]
+            
+            keyboard = [[InlineKeyboardButton("▶️ စတင် Run မည်", callback_data=f"run__{target_msg_id}")], [InlineKeyboardButton("🗑️ စနစ်ထဲမှ ဖျက်မည်", callback_data=f"del__{target_msg_id}")]]
+            await query.edit_message_text(text=f"📄 ဖိုင်အမည်: `{display_name}`\n🔴 အခြေအနေ: အပြီးသတ် သတ် (Kill) ပြီးပါပြီ", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+            
+    elif action == "log":
+        if os.path.exists(f"{file_path}.log"):
+            try: await context.bot.send_document(chat_id=query.message.chat_id, document=open(f"{file_path}.log", 'rb'))
+            except: pass
+            
+    elif action == "del":
+        if user_id in running_processes and file_path in running_processes[user_id]:
+            try:
+                os.killpg(os.getpgid(running_processes[user_id][file_path]["process"].pid), signal.SIGKILL)
+                running_processes[user_id][file_path]["process"].wait()
+            except: pass
+            del running_processes[user_id][file_path]
+        if os.path.exists(file_path): os.remove(file_path)
+        if os.path.exists(f"{file_path}.log"): os.remove(f"{file_path}.log")
+        await query.edit_message_text("🗑️ ဖိုင်နှင့် မလိုအပ်သော Log Data အားလုံးကို Server ပေါ်မှ အပြီးပိုင် ဖျက်ဆီးပြီးပါပြီ။")
 
-            chat_id, message_id = getChatMsgID(post_url)
-            chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
+# --- 📋 STATUS SYSTEM ---
+async def admin_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id): return
 
-            if not chat_message:
-                await message.reply("**❌ Message not found or inaccessible.**")
-                return False
+    active_scripts_text = ""
+    global_active_count = 0
+    
+    for uid, files in running_processes.items():
+        for fpath, p_info in list(files.items()):
+            if p_info["process"].poll() is None:
+                global_active_count += 1
+                active_scripts_text += f"🔹 <b>{p_info['display_name']}</b> (PID: <code>{p_info['pid']}</code>)\n"
 
-            LOGGER(__name__).info(f"Downloading media from URL: {post_url}")
+    text = "📊 <b>Server Monitor (Admin Only)</b>\n----------------------------------\n"
+    text += f"🔥 လည်ပတ်နေသော Script စုစုပေါင်း: {global_active_count} ခု\n\n"
+    text += "📝 <b>Active Scripts List:</b>\n"
+    text += active_scripts_text if active_scripts_text != "" else "❌ လက်ရှိ မည်သည့် Script မျှ Run မထားပါ။\n"
+    
+    await update.message.reply_text(text, parse_mode="HTML")
 
-            if chat_message.document or chat_message.video or chat_message.audio:
-                file_size = (
-                    chat_message.document.file_size
-                    if chat_message.document
-                    else chat_message.video.file_size
-                    if chat_message.video
-                    else chat_message.audio.file_size
-                )
+# --- ☠️ FORCE KILL COMMAND ---
+async def kill_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id): return
+    
+    if not context.args:
+        await update.message.reply_text("❌ ကျေးဇူးပြု၍ သတ်လိုသော PID ထည့်ပေးပါ။ ပုံစံ: <code>/kill [PID]</code>", parse_mode="HTML"); return
+        
+    try: target_pid = int(context.args[0])
+    except: await update.message.reply_text("❌ PID သည် ဂဏန်းဖြစ်ရပါမည်။"); return
 
-                if not await fileSizeLimit(
-                    file_size, message, "download", user.me.is_premium
-                ):
-                    return
-
-            raw_caption, raw_caption_entities = get_raw_text(
-                chat_message.caption, chat_message.caption_entities
-            )
-            raw_text, raw_text_entities = get_raw_text(
-                chat_message.text, chat_message.entities
-            )
-
-            if chat_message.media_group_id:
-                if not await processMediaGroup(chat_message, bot, message, forward_chat_id=effective_forward_chat_id):
-                    await message.reply(
-                        "**Could not extract any valid media from the media group.**"
-                    )
-                return
-
-            has_downloadable_media = (
-                chat_message.photo
-                or chat_message.video
-                or chat_message.audio
-                or chat_message.document
-                or chat_message.voice
-                or chat_message.video_note
-                or chat_message.animation
-                or chat_message.sticker
-            )
-
-            if has_downloadable_media:
-                start_time = time()
-                progress_message = await message.reply("**📥 Downloading Progress...**")
-
-                filename = get_file_name(message_id, chat_message)
-                download_path = get_download_path(message.id, filename)
-
-                media_path = None
-                for attempt in range(2):
-                    try:
-                        media_path = await chat_message.download(
-                            file_name=download_path,
-                            progress=Leaves.progress_for_pyrogram,
-                            progress_args=progressArgs(
-                                "📥 Downloading Progress", progress_message, start_time
-                            ),
-                        )
-                        break
-                    except FloodWait as e:
-                        wait_s = int(getattr(e, "value", 0) or 0)
-                        LOGGER(__name__).warning(f"FloodWait while downloading media: {wait_s}s")
-                        if wait_s > 0 and attempt == 0:
-                            await asyncio.sleep(wait_s + 1)
-                            continue
-                        raise
-
-                if not media_path or not os.path.exists(media_path):
-                    await progress_message.edit("**❌ Download failed: File not saved properly**")
-                    return
-
-                file_size = os.path.getsize(media_path)
-                if file_size == 0:
-                    await progress_message.edit("**❌ Download failed: File is empty**")
-                    cleanup_download(media_path)
-                    return
-
-                LOGGER(__name__).info(f"Downloaded media: {media_path} (Size: {file_size} bytes)")
-
-                media_type = (
-                    "photo"
-                    if chat_message.photo
-                    else "video"
-                    if chat_message.video
-                    else "audio"
-                    if chat_message.audio
-                    else "voice"
-                    if chat_message.voice
-                    else "video_note"
-                    if chat_message.video_note
-                    else "animation"
-                    if chat_message.animation
-                    else "sticker"
-                    if chat_message.sticker
-                    else "document"
-                )
-                await send_media(
-                    bot,
-                    message,
-                    media_path,
-                    media_type,
-                    raw_caption,
-                    raw_caption_entities,
-                    progress_message,
-                    start_time,
-                    forward_chat_id=effective_forward_chat_id,
-                )
-
-                cleanup_download(media_path)
-                await progress_message.delete()
-                return True
-
-            elif chat_message.poll:
-                await message.reply("**This post contains a poll which cannot be downloaded.**")
-
-            elif chat_message.text or chat_message.caption:
-                txt = raw_text or raw_caption
-                ents = raw_text_entities if raw_text else raw_caption_entities
-                sent_text = None
+    found = False
+    for uid, files in list(running_processes.items()):
+        for fpath, p_info in list(files.items()):
+            if p_info["pid"] == target_pid:
                 try:
-                    sent_text = await message.reply(txt, entities=ents or None)
-                except BadRequest as e:
-                    if "ENTITY_TEXT_INVALID" in str(e):
-                        LOGGER(__name__).warning(f"ENTITY_TEXT_INVALID in text reply, retrying without entities: {e}")
-                        sent_text = await message.reply(txt)
-                    else:
-                        raise
-                if effective_forward_chat_id and sent_text:
-                    try:
-                        await bot.copy_message(
-                            chat_id=effective_forward_chat_id,
-                            from_chat_id=sent_text.chat.id,
-                            message_id=sent_text.id,
-                        )
-                        LOGGER(__name__).info(f"Copied text message to chat: {effective_forward_chat_id}")
-                    except Exception as e:
-                        LOGGER(__name__).error(f"Failed to copy text message to {effective_forward_chat_id}: {e}")
-                return True
-            else:
-                await message.reply("**No media or text found in the post URL.**")
-                return False
-
-        except FloodWait as e:
-            wait_s = int(getattr(e, "value", 0) or 0)
-            LOGGER(__name__).warning(f"FloodWait in handle_download: {wait_s}s")
-            if wait_s > 0:
-                await asyncio.sleep(wait_s + 1)
-            return False
-        except PeerIdInvalid as e:
-            LOGGER(__name__).error(f"PeerIdInvalid for {post_url}: {e}")
-            await message.reply(
-                "**❌ Access Denied**\n\n"
-                "The user client cannot access this chat.\n"
-                "Make sure the user account has joined the channel/group.\n\n"
-                f"**Details:** `{e}`"
-            )
-        except BadRequest as e:
-            LOGGER(__name__).error(f"BadRequest for {post_url}: {e}")
-            await message.reply(
-                "**❌ Bad Request**\n\n"
-                f"Telegram returned an error: `{e}`\n\n"
-                "This may happen if the message ID is invalid or the chat is inaccessible."
-            )
-        except KeyError as e:
-            LOGGER(__name__).error(f"KeyError for {post_url}: {e}")
-            await message.reply(f"**❌ Invalid URL format:** `{e}`")
-            return False
-        except ValueError as e:
-            LOGGER(__name__).error(f"ValueError for {post_url}: {e}")
-            await message.reply(f"**❌ Invalid URL:** `{e}`")
-            return False
-        except Exception as e:
-            LOGGER(__name__).error(f"Unexpected error for {post_url}: {e}")
-            await message.reply(f"**❌ Unexpected error:** `{e}`")
-            return False
-
-
-@bot.on_message(filters.command("dl") & filters.private)
-async def download_media(bot: Client, message: Message):
-    if len(message.command) < 2:
-        await message.reply("**Provide a post URL after the /dl command.**")
-        return
-
-    post_url = message.command[1]
-    track_task(handle_download(bot, message, post_url))
-
-
-@bot.on_message(filters.command("bdl") & filters.private)
-async def download_range(bot: Client, message: Message):
-    args = message.text.split()
-
-    if len(args) != 3 or not all(arg.startswith("https://t.me/") for arg in args[1:]):
-        await message.reply(
-            "🚀 **Batch Download Process**\n"
-            "`/bdl start_link end_link`\n\n"
-            "💡 **Example:**\n"
-            "`/bdl https://t.me/mychannel/100 https://t.me/mychannel/120`"
-        )
-        return
-
-    try:
-        start_chat, start_id = getChatMsgID(args[1])
-        end_chat,   end_id   = getChatMsgID(args[2])
-    except Exception as e:
-        return await message.reply(f"**❌ Error parsing links:\n{e}**")
-
-    if start_chat != end_chat:
-        return await message.reply("**❌ Both links must be from the same channel.**")
-    if start_id > end_id:
-        return await message.reply("**❌ Invalid range: start ID cannot exceed end ID.**")
-
-    try:
-        await user.get_chat(start_chat)
-    except Exception:
-        pass
-
-    prefix = args[1].rsplit("/", 1)[0]
-    loading = await message.reply(f"📥 **Downloading posts {start_id}–{end_id}…**")
-
-    downloaded = skipped = failed = 0
-    processed_media_groups = set()
-    batch_tasks = []
-    BATCH_SIZE = PyroConf.BATCH_SIZE
-
-    for msg_id in range(start_id, end_id + 1):
-        url = f"{prefix}/{msg_id}"
+                    os.killpg(os.getpgid(target_pid), signal.SIGKILL)
+                    p_info["process"].wait()
+                except: pass
+                del running_processes[uid][fpath]
+                found = True
+                await update.message.reply_text(f"💥 PID: <code>{target_pid}</code> နှင့် ၎င်းနှင့်ပတ်သက်သော Data အားလုံးကို Force Kill လုပ်ပြီးပါပြီ။", parse_mode="HTML")
+                break
+        if found: break
+    if not found: 
         try:
-            chat_msg = await user.get_messages(chat_id=start_chat, message_ids=msg_id)
-            if not chat_msg:
-                skipped += 1
-                continue
+            os.killpg(os.getpgid(target_pid), signal.SIGKILL)
+            await update.message.reply_text(f"⚡ စာရင်းထဲမရှိသော်လည်း Background ရှိ PID: {target_pid} ကို အတင်းအကျပ် Kill လိုက်ပါပြီ။")
+        except:
+            await update.message.reply_text(f"❌ သတ်မှတ်ထားသော PID: {target_pid} အား Server ပေါ်တွင် ရှာမတွေ့ပါ။")
 
-            if chat_msg.media_group_id:
-                if chat_msg.media_group_id in processed_media_groups:
-                    skipped += 1
-                    continue
-                processed_media_groups.add(chat_msg.media_group_id)
+def main():
+    if not BOT_TOKEN:
+        print("❌ CRITICAL ERROR: BOT_TOKEN is missing!")
+        return
 
-            has_media = bool(chat_msg.media_group_id or chat_msg.media)
-            has_text  = bool(chat_msg.text or chat_msg.caption)
-            if not (has_media or has_text):
-                skipped += 1
-                continue
-
-            task = track_task(handle_download(bot, message, url))
-            batch_tasks.append(task)
-
-            if len(batch_tasks) >= BATCH_SIZE:
-                results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-                for result in results:
-                    if isinstance(result, asyncio.CancelledError):
-                        await loading.delete()
-                        return await message.reply(
-                            f"**❌ Batch canceled** after downloading `{downloaded}` posts."
-                        )
-                    elif isinstance(result, Exception):
-                        failed += 1
-                        LOGGER(__name__).error(f"Error: {result}")
-                    elif result:
-                        downloaded += 1
-                    else:
-                        failed += 1
-
-                batch_tasks.clear()
-                await asyncio.sleep(PyroConf.FLOOD_WAIT_DELAY)
-
-        except Exception as e:
-            failed += 1
-            LOGGER(__name__).error(f"Error at {url}: {e}")
-
-    if batch_tasks:
-        results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-        for result in results:
-            if isinstance(result, Exception):
-                failed += 1
-            elif result:
-                downloaded += 1
-            else:
-                failed += 1
-
-    await loading.delete()
-    await message.reply(
-        "**✅ Batch Process Complete!**\n"
-        "━━━━━━━━━━━━━━━━━━━\n"
-        f"📥 **Downloaded** : `{downloaded}` post(s)\n"
-        f"⏭️ **Skipped**    : `{skipped}` (no content)\n"
-        f"❌ **Failed**     : `{failed}` error(s)"
-    )
-
-
-@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "bdl", "stats", "logs", "killall", "cleanup"]))
-async def handle_any_message(bot: Client, message: Message):
-    if message.text and not message.text.startswith("/"):
-        txt = message.text.strip()
-        if txt.startswith("https://t.me/") or txt.startswith("https://telegram.me/"):
-            track_task(handle_download(bot, message, txt))
-
-
-@bot.on_message(filters.command("stats") & filters.private)
-async def stats(_, message: Message):
-    currentTime = get_readable_time(time() - PyroConf.BOT_START_TIME)
-    total, used, free = shutil.disk_usage(".")
-    total = get_readable_file_size(total)
-    used = get_readable_file_size(used)
-    free = get_readable_file_size(free)
-    sent = get_readable_file_size(psutil.net_io_counters().bytes_sent)
-    recv = get_readable_file_size(psutil.net_io_counters().bytes_recv)
-    cpuUsage = psutil.cpu_percent(interval=0.5)
-    memory = psutil.virtual_memory().percent
-    disk = psutil.disk_usage("/").percent
-    process = psutil.Process(os.getpid())
-
-    stats = (
-        "**≧◉◡◉≦ Bot is Up and Running successfully.**\n\n"
-        f"**➜ Bot Uptime:** `{currentTime}`\n"
-        f"**➜ Total Disk Space:** `{total}`\n"
-        f"**➜ Used:** `{used}`\n"
-        f"**➜ Free:** `{free}`\n"
-        f"**➜ Memory Usage:** `{round(process.memory_info()[0] / 1024**2)} MiB`\n\n"
-        f"**➜ Upload:** `{sent}`\n"
-        f"**➜ Download:** `{recv}`\n\n"
-        f"**➜ CPU:** `{cpuUsage}%` | "
-        f"**➜ RAM:** `{memory}%` | "
-        f"**➜ DISK:** `{disk}%`"
-    )
-    await message.reply(stats)
-
-
-@bot.on_message(filters.command("logs") & filters.private)
-async def logs(_, message: Message):
-    if os.path.exists("logs.txt"):
-        await message.reply_document(document="logs.txt", caption="**Logs**")
-    else:
-        await message.reply("**Not exists**")
-
-
-@bot.on_message(filters.command("killall") & filters.private)
-async def cancel_all_tasks(_, message: Message):
-    cancelled = 0
-    for task in list(RUNNING_TASKS):
-        if not task.done():
-            task.cancel()
-            cancelled += 1
-    await message.reply(f"**Cancelled {cancelled} running task(s).**")
-
-
-async def initialize():
-    global download_semaphore, forward_chat_id
-    download_semaphore = asyncio.Semaphore(PyroConf.MAX_CONCURRENT_DOWNLOADS)
-
-    if PyroConf.FORWARD_CHAT_ID:
-        forward_chat_id = await resolve_forward_chat_id(PyroConf.FORWARD_CHAT_ID)
-        LOGGER(__name__).info(f"Auto-forward enabled. Target chat: {forward_chat_id}")
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    # ၃၀ စက္ကန့်တစ်ကြိမ် မလိုအပ်တဲ့ data တွေ လိုက်သတ်မယ့် စနစ်ဖွင့်မယ်
+    start_background_cleaner()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", admin_status))
+    app.add_handler(CommandHandler("stats", admin_status))
+    app.add_handler(CommandHandler("kill", kill_process))
+    
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(CallbackQueryHandler(button_click))
+    
+    print("🤖 KRAW Admin-Only Private Hosting Engine Active Perfectly...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    try:
-        LOGGER(__name__).info("Bot Started!")
-        asyncio.get_event_loop().run_until_complete(initialize())
-        user.start()
-        bot.run()
-    except KeyboardInterrupt:
-        pass
-    except Exception as err:
-        LOGGER(__name__).error(err)
-    finally:
-        LOGGER(__name__).info("Bot Stopped")
+    main()
